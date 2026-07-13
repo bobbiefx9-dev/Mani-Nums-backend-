@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: mani-nums-backend
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    disk:
+      name: mani-nums-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+    envVars:
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: SITE_URL
+        sync: false
+      - key: ALLOWED_ORIGIN
+        sync: false
+      - key: DB_PATH
+        value: /opt/render/project/src/data/farline.db

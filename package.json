@@ -1,0 +1,22 @@
+{
+  "name": "mani-nums-backend",
+  "version": "1.0.0",
+  "description": "Backend for the Mani Nums foreign-numbers marketplace, using Twilio to search and purchase phone numbers.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "twilio": "^5.3.0",
+    "dotenv": "^16.4.5",
+    "cors": "^2.8.5",
+    "stripe": "^17.3.1",
+    "better-sqlite3": "^11.3.0",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "nodemailer": "^6.9.15"
+  }
+}

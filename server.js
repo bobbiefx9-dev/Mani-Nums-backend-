@@ -387,4 +387,12 @@ app.listen(port, () => {
   console.log(`ADMIN_KEY:     ${process.env.ADMIN_KEY ? 'OK' : 'NOT SET (admin routes disabled)'}`);
   console.log(`SMTP:          ${process.env.SMTP_HOST ? 'configured (not verified — check the inbox after signing up)' : 'NOT CONFIGURED (verification/reset emails will fail silently, logged as errors)'}`);
   console.log('--------------------');
+
+  // The Twilio SDK only checks the SID's format at startup, not whether the
+  // credentials work, so verify the login for real and say so in the logs.
+  if (client) {
+    client.api.accounts(process.env.TWILIO_ACCOUNT_SID).fetch()
+      .then(a => console.log(`Twilio login: VERIFIED (${a.status} account)`))
+      .catch(err => console.error(`Twilio login: FAILED — ${err.message}. Re-copy TWILIO_AUTH_TOKEN from the Twilio console.`));
+  }
 });

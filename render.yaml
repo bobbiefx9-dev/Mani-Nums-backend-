@@ -14,10 +14,14 @@ services:
         sync: false
       - key: TWILIO_AUTH_TOKEN
         sync: false
-      - key: STRIPE_SECRET_KEY
+      - key: PAYSTACK_SECRET_KEY
         sync: false
-      - key: STRIPE_WEBHOOK_SECRET
+      - key: PAYSTACK_CURRENCY
+        value: USD
+      - key: ADMIN_KEY
         sync: false
+      - key: PUBLIC_URL
+        value: https://mani-nums-backend.onrender.com
       - key: JWT_SECRET
         generateValue: true
       - key: SMTP_HOST

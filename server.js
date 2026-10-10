@@ -1,8 +1,8 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const twilio = require('twilio');
-const Stripe = require('stripe');
 const db = require('./db');
 const { router: authRouter, requireAuth, requireVerified } = require('./auth');
 
@@ -24,23 +24,37 @@ function requireTwilio(req, res, next) {
   next();
 }
 
-// Stripe's SDK also throws at construction time if no key is provided at
-// all (not just an invalid one) — same guard pattern as Twilio above.
-let stripe = null;
-try {
-  stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-} catch (err) {
-  console.warn('Stripe client not initialized (check STRIPE_SECRET_KEY in .env):', err.message);
-}
-function requireStripe(req, res, next) {
-  if (!stripe) return res.status(503).json({ error: 'Stripe is not configured on this server yet' });
+// ---------------------------------------------------------------------------
+// Paystack (payments). Replaces Stripe, which doesn't support Nigerian
+// businesses. Uses Paystack's REST API directly, so there is no SDK to
+// construct and nothing to crash at boot when the key is missing.
+//
+// PAYSTACK_CURRENCY: "USD" (default; USD must be enabled on your Paystack
+// account) or "NGN". With NGN, prices (set in dollars by the frontend) are
+// converted using USD_NGN_RATE, e.g. 1500.
+// ---------------------------------------------------------------------------
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+const PAYSTACK_CURRENCY = (process.env.PAYSTACK_CURRENCY || 'USD').toUpperCase();
+
+function requirePaystack(req, res, next) {
+  if (!PAYSTACK_SECRET) return res.status(503).json({ error: 'Payments are not configured on this server yet' });
   next();
+}
+
+async function paystack(method, path, body) {
+  const resp = await fetch(`https://api.paystack.co${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || data.status === false) throw new Error(data.message || `Paystack HTTP ${resp.status}`);
+  return data.data;
 }
 
 // Admin-only routes (direct purchase, release, account inventory) spend or
 // destroy real Twilio resources, so they require a secret key header.
 // If ADMIN_KEY isn't set on the server, these routes stay disabled.
-const crypto = require('crypto');
 function requireAdmin(req, res, next) {
   const key = process.env.ADMIN_KEY;
   if (!key) return res.status(503).json({ error: 'Admin routes are disabled (ADMIN_KEY not set)' });
@@ -66,31 +80,50 @@ function validateTwilio(req, res, next) {
   next();
 }
 
-// The Stripe webhook route needs the raw request body to verify the
-// signature, so it must be registered with express.raw() BEFORE the
+// ---------------------------------------------------------------------------
+// POST /api/webhooks/paystack
+// Paystack calls this when a payment succeeds. It needs the raw request body
+// to verify the signature, so it's registered with express.raw() BEFORE the
 // general express.json() middleware below applies to everything else.
-app.post('/api/webhooks/stripe', requireStripe, express.raw({ type: 'application/json' }), async (req, res) => {
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('Stripe webhook signature check failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+// Payment is confirmed here, and ONLY here, is the number bought from Twilio.
+// ---------------------------------------------------------------------------
+const inFlight = new Set();
+
+app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!PAYSTACK_SECRET) return res.status(503).end();
+
+  const expected = Buffer.from(crypto.createHmac('sha512', PAYSTACK_SECRET).update(req.body).digest('hex'));
+  const given = Buffer.from(String(req.headers['x-paystack-signature'] || ''));
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) {
+    console.error('Paystack webhook signature check failed');
+    return res.status(400).send('Invalid signature');
   }
 
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const { phoneNumber, country, type, userId } = session.metadata || {};
+  let event;
+  try {
+    event = JSON.parse(req.body.toString('utf8'));
+  } catch (err) {
+    return res.status(400).send('Bad payload');
+  }
 
-    if (!phoneNumber) {
-      console.error('Checkout completed but no phoneNumber in metadata', session.id);
-      return res.json({ received: true });
-    }
+  if (event.event !== 'charge.success') return res.json({ received: true });
 
-    // Stripe retries webhooks, so don't buy a second number for the same payment.
-    const already = db.prepare('SELECT 1 FROM numbers WHERE stripe_session_id = ?').get(session.id);
-    if (already) return res.json({ received: true });
+  const charge = event.data || {};
+  const reference = charge.reference;
+  const { phoneNumber, country, type, userId } = charge.metadata || {};
 
+  if (!reference || !phoneNumber) {
+    console.error('Payment succeeded but reference/phoneNumber missing from metadata', reference);
+    return res.json({ received: true });
+  }
+
+  // Paystack retries webhooks, so don't buy a second number for the same payment.
+  // (The stripe_session_id column now stores the Paystack payment reference.)
+  const already = db.prepare('SELECT 1 FROM numbers WHERE stripe_session_id = ?').get(reference);
+  if (already || inFlight.has(reference)) return res.json({ received: true });
+  inFlight.add(reference);
+
+  try {
     let purchased;
     try {
       if (!client) throw new Error('Twilio is not configured on this server');
@@ -101,16 +134,15 @@ app.post('/api/webhooks/stripe', requireStripe, express.raw({ type: 'application
         smsUrl: `${PUBLIC_URL}/api/webhooks/sms`,
         smsMethod: 'POST',
       });
-      console.log(`Purchased ${purchased.phoneNumber} (sid ${purchased.sid}) after payment ${session.id}`);
+      console.log(`Purchased ${purchased.phoneNumber} (sid ${purchased.sid}) after payment ${reference}`);
     } catch (err) {
       console.error('Payment succeeded but Twilio purchase failed:', err.message);
       // The user paid but we couldn't deliver the number, so refund automatically.
       try {
-        if (!session.payment_intent) throw new Error('no payment_intent on session');
-        await stripe.refunds.create({ payment_intent: session.payment_intent });
-        console.log(`Refunded payment ${session.payment_intent} for session ${session.id}`);
+        await paystack('POST', '/refund', { transaction: reference });
+        console.log(`Refund requested for payment ${reference}`);
       } catch (refundErr) {
-        console.error(`REFUND FAILED for session ${session.id} — refund manually in Stripe:`, refundErr.message);
+        console.error(`REFUND FAILED for payment ${reference} — refund manually in the Paystack dashboard:`, refundErr.message);
       }
       return res.json({ received: true });
     }
@@ -119,14 +151,15 @@ app.post('/api/webhooks/stripe', requireStripe, express.raw({ type: 'application
       db.prepare(`
         INSERT INTO numbers (user_id, phone_number, twilio_sid, country, type, stripe_session_id)
         VALUES (?, ?, ?, ?, ?, ?)
-      `).run(Number(userId), purchased.phoneNumber, purchased.sid, country || null, type || null, session.id);
+      `).run(Number(userId), purchased.phoneNumber, purchased.sid, country || null, type || null, reference);
     } catch (err) {
       // The number is bought and paid for; don't refund. Log everything needed to fix it by hand.
-      console.error(`DB insert failed for ${purchased.phoneNumber} (twilio sid ${purchased.sid}, user ${userId}, session ${session.id}):`, err.message);
+      console.error(`DB insert failed for ${purchased.phoneNumber} (twilio sid ${purchased.sid}, user ${userId}, payment ${reference}):`, err.message);
     }
+    res.json({ received: true });
+  } finally {
+    inFlight.delete(reference);
   }
-
-  res.json({ received: true });
 });
 
 // Everything else can use normal JSON body parsing.
@@ -164,66 +197,77 @@ app.get('/api/numbers/search', requireTwilio, async (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /api/checkout/create-session
 // Body: { phoneNumber, country, type, price } (price in whole dollars)
-// Creates a Stripe Checkout session. The number is NOT purchased yet —
-// that only happens once Stripe confirms payment, in the webhook below.
+// Starts a Paystack payment. The number is NOT purchased yet — that only
+// happens once Paystack confirms payment, in the webhook above.
 // The frontend should redirect the browser to the returned `url`.
 // ---------------------------------------------------------------------------
-app.post('/api/checkout/create-session', requireVerified, requireStripe, async (req, res) => {
+app.post('/api/checkout/create-session', requireVerified, requirePaystack, async (req, res) => {
   const { phoneNumber, country, type, price } = req.body;
   if (!phoneNumber || !price) {
     return res.status(400).json({ error: 'phoneNumber and price are required' });
   }
+  const dollars = Number(price);
+  if (!Number.isFinite(dollars) || dollars <= 0) {
+    return res.status(400).json({ error: 'price must be a positive number' });
+  }
+
+  let amount; // in the currency's smallest unit (cents / kobo)
+  if (PAYSTACK_CURRENCY === 'NGN') {
+    const rate = Number(process.env.USD_NGN_RATE);
+    if (!rate) return res.status(503).json({ error: 'USD_NGN_RATE is not set on this server' });
+    amount = Math.round(dollars * rate * 100);
+  } else {
+    amount = Math.round(dollars * 100);
+  }
 
   try {
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      payment_method_types: ['card'],
-      line_items: [{
-        price_data: {
-          currency: 'usd',
-          product_data: {
-            name: `${country || ''} number — ${phoneNumber}`.trim(),
-            description: type === 'voip' ? 'Standing VoIP line, billed monthly' : 'SMS verification number',
-          },
-          unit_amount: Math.round(Number(price) * 100), // Stripe wants cents
-        },
-        quantity: 1,
-      }],
-      metadata: { phoneNumber, country: country || '', type: type || '', userId: String(req.user.sub) },
-      success_url: `${process.env.SITE_URL}/success.html?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.SITE_URL}/farline-website.html`,
+    const reference = `mn_${crypto.randomUUID()}`;
+    const data = await paystack('POST', '/transaction/initialize', {
+      email: req.user.email,
+      amount,
+      currency: PAYSTACK_CURRENCY,
+      reference,
+      // Paystack appends ?trxref=...&reference=... to this URL.
+      callback_url: `${process.env.SITE_URL}/success.html?session_id=${reference}`,
+      metadata: {
+        phoneNumber,
+        country: country || '',
+        type: type || '',
+        userId: String(req.user.sub),
+        cancel_action: `${process.env.SITE_URL}/farline-website.html`,
+      },
     });
-    res.json({ url: session.url, id: session.id });
+    res.json({ url: data.authorization_url, id: reference });
   } catch (err) {
     console.error(err.message);
-    res.status(502).json({ error: 'Stripe session creation failed', detail: err.message });
+    res.status(502).json({ error: 'Payment could not be started', detail: err.message });
   }
 });
 
 // ---------------------------------------------------------------------------
 // GET /api/checkout/session/:id
 // Lets the success page confirm what actually happened, rather than
-// assuming success just because the browser landed on success_url.
+// assuming success just because the browser landed on the callback URL.
 // ---------------------------------------------------------------------------
-app.get('/api/checkout/session/:id', requireStripe, async (req, res) => {
+app.get('/api/checkout/session/:id', requirePaystack, async (req, res) => {
   try {
-    const session = await stripe.checkout.sessions.retrieve(req.params.id);
+    const tx = await paystack('GET', `/transaction/verify/${encodeURIComponent(req.params.id)}`);
     res.json({
-      paymentStatus: session.payment_status, // "paid" | "unpaid" | "no_payment_required"
-      phoneNumber: session.metadata?.phoneNumber,
-      country: session.metadata?.country,
+      paymentStatus: tx.status === 'success' ? 'paid' : 'unpaid', // "paid" | "unpaid"
+      phoneNumber: tx.metadata?.phoneNumber,
+      country: tx.metadata?.country,
     });
   } catch (err) {
-    res.status(404).json({ error: 'Session not found' });
+    res.status(404).json({ error: 'Payment not found' });
   }
 });
 
 // ---------------------------------------------------------------------------
 // POST /api/numbers/purchase
 // Body: { phoneNumber: "+442071838750" }
-// Buys a number directly, bypassing payment. Keep this admin-only (behind
-// your own auth) — the public flow should go through
-// /api/checkout/create-session so the user pays before Twilio bills you.
+// Buys a number directly, bypassing payment. Admin-only (x-admin-key header)
+// — the public flow goes through /api/checkout/create-session so the user
+// pays before Twilio bills you.
 // ---------------------------------------------------------------------------
 app.post('/api/numbers/purchase', requireAdmin, requireTwilio, async (req, res) => {
   const { phoneNumber } = req.body;
@@ -267,6 +311,7 @@ app.get('/api/numbers/mine/:phoneNumber/messages', requireAuth, (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /api/numbers/owned
 // Lists numbers already purchased on this Twilio account (your "inventory").
+// Admin-only.
 // ---------------------------------------------------------------------------
 app.get('/api/numbers/owned', requireAdmin, requireTwilio, async (req, res) => {
   try {
@@ -279,7 +324,7 @@ app.get('/api/numbers/owned', requireAdmin, requireTwilio, async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // DELETE /api/numbers/:sid
-// Releases (cancels) a purchased number — stops billing for it.
+// Releases (cancels) a purchased number — stops billing for it. Admin-only.
 // ---------------------------------------------------------------------------
 app.delete('/api/numbers/:sid', requireAdmin, requireTwilio, async (req, res) => {
   try {
@@ -292,9 +337,9 @@ app.delete('/api/numbers/:sid', requireAdmin, requireTwilio, async (req, res) =>
 
 // ---------------------------------------------------------------------------
 // POST /api/webhooks/sms
-// Point a purchased number's "A message comes in" webhook (in the Twilio
-// console, or set programmatically) at this URL to receive incoming SMS/
-// verification codes server-side, then push them to your app's inbox UI.
+// Purchased numbers are pointed at this URL automatically, so incoming
+// SMS/verification codes land in the database and show up in the user's inbox.
+// Requests are verified against Twilio's signature.
 // ---------------------------------------------------------------------------
 app.post('/api/webhooks/sms', validateTwilio, (req, res) => {
   const { From, To, Body } = req.body;
@@ -309,10 +354,10 @@ app.listen(port, () => {
   console.log(`Mani Nums backend running on http://localhost:${port}`);
   console.log('--- Config check ---');
   console.log(`Twilio:        ${client ? 'OK' : 'NOT CONFIGURED (numbers/* routes will 503)'}`);
-  console.log(`Stripe:        ${stripe ? 'OK' : 'NOT CONFIGURED (checkout/* routes will 503)'}`);
+  console.log(`Paystack:      ${PAYSTACK_SECRET ? `OK (${PAYSTACK_CURRENCY})` : 'NOT CONFIGURED (checkout/* routes will 503)'}`);
   console.log(`JWT_SECRET:    ${process.env.JWT_SECRET ? 'OK' : 'MISSING (auth will fail on first request)'}`);
-  console.log(`SITE_URL:      ${process.env.SITE_URL || 'NOT SET (email links and Stripe redirects will be broken)'}`);
-  console.log(`ADMIN_KEY:      ${process.env.ADMIN_KEY ? 'OK' : 'NOT SET (admin routes disabled)'}`);
+  console.log(`SITE_URL:      ${process.env.SITE_URL || 'NOT SET (email links and payment redirects will be broken)'}`);
+  console.log(`ADMIN_KEY:     ${process.env.ADMIN_KEY ? 'OK' : 'NOT SET (admin routes disabled)'}`);
   console.log(`SMTP:          ${process.env.SMTP_HOST ? 'configured (not verified — check the inbox after signing up)' : 'NOT CONFIGURED (verification/reset emails will fail silently, logged as errors)'}`);
   console.log('--------------------');
 });

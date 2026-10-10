@@ -52,6 +52,30 @@ async function paystack(method, path, body) {
   return data.data;
 }
 
+// ---------------------------------------------------------------------------
+// Catalog: what each country's numbers cost, in USD. This is the source of
+// truth for pricing — the website's displayed prices should match it. To add
+// a country or change a price, edit this list and push.
+// type: "sms" = per-code verification number, "voip" = standing line (monthly)
+// ---------------------------------------------------------------------------
+const CATALOG = [
+  { code: '+44',  country: 'United Kingdom', type: 'sms',  price: 2.40 },
+  { code: '+81',  country: 'Japan',          type: 'sms',  price: 3.10 },
+  { code: '+49',  country: 'Germany',        type: 'voip', price: 8.00 },
+  { code: '+55',  country: 'Brazil',         type: 'sms',  price: 1.90 },
+  { code: '+971', country: 'UAE',            type: 'voip', price: 11.50 },
+  { code: '+33',  country: 'France',         type: 'sms',  price: 2.20 },
+  { code: '+82',  country: 'South Korea',    type: 'sms',  price: 2.90 },
+  { code: '+1',   country: 'Canada',         type: 'voip', price: 6.50 },
+  { code: '+65',  country: 'Singapore',      type: 'voip', price: 9.00 },
+];
+function lookupCatalog(phoneNumber) {
+  // Longest dial-code prefix wins (e.g. +971 before +9...).
+  return CATALOG
+    .filter(c => phoneNumber.startsWith(c.code))
+    .sort((a, b) => b.code.length - a.code.length)[0] || null;
+}
+
 // Admin-only routes (direct purchase, release, account inventory) spend or
 // destroy real Twilio resources, so they require a secret key header.
 // If ADMIN_KEY isn't set on the server, these routes stay disabled.
@@ -196,20 +220,23 @@ app.get('/api/numbers/search', requireTwilio, async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // POST /api/checkout/create-session
-// Body: { phoneNumber, country, type, price } (price in whole dollars)
+// Body: { phoneNumber } (price/country/type are looked up server-side)
 // Starts a Paystack payment. The number is NOT purchased yet — that only
 // happens once Paystack confirms payment, in the webhook above.
 // The frontend should redirect the browser to the returned `url`.
 // ---------------------------------------------------------------------------
 app.post('/api/checkout/create-session', requireVerified, requirePaystack, async (req, res) => {
-  const { phoneNumber, country, type, price } = req.body;
-  if (!phoneNumber || !price) {
-    return res.status(400).json({ error: 'phoneNumber and price are required' });
+  const { phoneNumber } = req.body;
+  if (!phoneNumber || !/^\+[1-9]\d{6,14}$/.test(phoneNumber)) {
+    return res.status(400).json({ error: 'phoneNumber is required in international format, e.g. +442071838750' });
   }
-  const dollars = Number(price);
-  if (!Number.isFinite(dollars) || dollars <= 0) {
-    return res.status(400).json({ error: 'price must be a positive number' });
-  }
+  // The server decides the price and type from the number's country code.
+  // Anything the browser sends for price/country/type is ignored.
+  const item = lookupCatalog(phoneNumber);
+  if (!item) return res.status(400).json({ error: 'numbers from that country are not for sale' });
+  const dollars = item.price;
+  const country = item.country;
+  const type = item.type;
 
   let amount; // in the currency's smallest unit (cents / kobo)
   if (PAYSTACK_CURRENCY === 'NGN') {

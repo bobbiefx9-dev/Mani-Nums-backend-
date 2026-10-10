@@ -37,6 +37,35 @@ function requireStripe(req, res, next) {
   next();
 }
 
+// Admin-only routes (direct purchase, release, account inventory) spend or
+// destroy real Twilio resources, so they require a secret key header.
+// If ADMIN_KEY isn't set on the server, these routes stay disabled.
+const crypto = require('crypto');
+function requireAdmin(req, res, next) {
+  const key = process.env.ADMIN_KEY;
+  if (!key) return res.status(503).json({ error: 'Admin routes are disabled (ADMIN_KEY not set)' });
+  const given = Buffer.from(String(req.headers['x-admin-key'] || ''));
+  const expected = Buffer.from(key);
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
+}
+
+// Public base URL of this backend, used to point purchased numbers' SMS
+// webhook at us and to validate Twilio's request signatures.
+const PUBLIC_URL = process.env.PUBLIC_URL || 'https://mani-nums-backend.onrender.com';
+
+function validateTwilio(req, res, next) {
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  if (!token) return res.status(503).end();
+  const signature = req.headers['x-twilio-signature'];
+  if (!signature || !twilio.validateRequest(token, signature, PUBLIC_URL + req.originalUrl, req.body || {})) {
+    return res.status(403).end();
+  }
+  next();
+}
+
 // The Stripe webhook route needs the raw request body to verify the
 // signature, so it must be registered with express.raw() BEFORE the
 // general express.json() middleware below applies to everything else.
@@ -58,21 +87,42 @@ app.post('/api/webhooks/stripe', requireStripe, express.raw({ type: 'application
       return res.json({ received: true });
     }
 
+    // Stripe retries webhooks, so don't buy a second number for the same payment.
+    const already = db.prepare('SELECT 1 FROM numbers WHERE stripe_session_id = ?').get(session.id);
+    if (already) return res.json({ received: true });
+
+    let purchased;
     try {
       if (!client) throw new Error('Twilio is not configured on this server');
-      // Payment is confirmed — NOW actually buy the number from Twilio.
-      const purchased = await client.incomingPhoneNumbers.create({ phoneNumber });
+      // Payment is confirmed — NOW actually buy the number from Twilio,
+      // and point its incoming-SMS webhook at this server.
+      purchased = await client.incomingPhoneNumbers.create({
+        phoneNumber,
+        smsUrl: `${PUBLIC_URL}/api/webhooks/sms`,
+        smsMethod: 'POST',
+      });
       console.log(`Purchased ${purchased.phoneNumber} (sid ${purchased.sid}) after payment ${session.id}`);
+    } catch (err) {
+      console.error('Payment succeeded but Twilio purchase failed:', err.message);
+      // The user paid but we couldn't deliver the number, so refund automatically.
+      try {
+        if (!session.payment_intent) throw new Error('no payment_intent on session');
+        await stripe.refunds.create({ payment_intent: session.payment_intent });
+        console.log(`Refunded payment ${session.payment_intent} for session ${session.id}`);
+      } catch (refundErr) {
+        console.error(`REFUND FAILED for session ${session.id} — refund manually in Stripe:`, refundErr.message);
+      }
+      return res.json({ received: true });
+    }
 
+    try {
       db.prepare(`
         INSERT INTO numbers (user_id, phone_number, twilio_sid, country, type, stripe_session_id)
         VALUES (?, ?, ?, ?, ?, ?)
       `).run(Number(userId), purchased.phoneNumber, purchased.sid, country || null, type || null, session.id);
     } catch (err) {
-      console.error('Payment succeeded but Twilio purchase failed:', err.message);
-      // TODO: this is the one case that needs a human or an automated
-      // refund — the user paid but you couldn't deliver the number.
-      // Consider calling stripe.refunds.create({ payment_intent: session.payment_intent }).
+      // The number is bought and paid for; don't refund. Log everything needed to fix it by hand.
+      console.error(`DB insert failed for ${purchased.phoneNumber} (twilio sid ${purchased.sid}, user ${userId}, session ${session.id}):`, err.message);
     }
   }
 
@@ -81,6 +131,8 @@ app.post('/api/webhooks/stripe', requireStripe, express.raw({ type: 'application
 
 // Everything else can use normal JSON body parsing.
 app.use(express.json());
+// Twilio posts incoming-SMS webhooks as form-encoded, not JSON.
+app.use(express.urlencoded({ extended: false }));
 
 app.use('/api/auth', authRouter);
 
@@ -173,7 +225,7 @@ app.get('/api/checkout/session/:id', requireStripe, async (req, res) => {
 // your own auth) — the public flow should go through
 // /api/checkout/create-session so the user pays before Twilio bills you.
 // ---------------------------------------------------------------------------
-app.post('/api/numbers/purchase', requireTwilio, async (req, res) => {
+app.post('/api/numbers/purchase', requireAdmin, requireTwilio, async (req, res) => {
   const { phoneNumber } = req.body;
   if (!phoneNumber) return res.status(400).json({ error: 'phoneNumber is required' });
 
@@ -216,7 +268,7 @@ app.get('/api/numbers/mine/:phoneNumber/messages', requireAuth, (req, res) => {
 // GET /api/numbers/owned
 // Lists numbers already purchased on this Twilio account (your "inventory").
 // ---------------------------------------------------------------------------
-app.get('/api/numbers/owned', requireTwilio, async (req, res) => {
+app.get('/api/numbers/owned', requireAdmin, requireTwilio, async (req, res) => {
   try {
     const owned = await client.incomingPhoneNumbers.list({ limit: 50 });
     res.json(owned.map(n => ({ sid: n.sid, phoneNumber: n.phoneNumber, friendlyName: n.friendlyName })));
@@ -229,7 +281,7 @@ app.get('/api/numbers/owned', requireTwilio, async (req, res) => {
 // DELETE /api/numbers/:sid
 // Releases (cancels) a purchased number — stops billing for it.
 // ---------------------------------------------------------------------------
-app.delete('/api/numbers/:sid', requireTwilio, async (req, res) => {
+app.delete('/api/numbers/:sid', requireAdmin, requireTwilio, async (req, res) => {
   try {
     await client.incomingPhoneNumbers(req.params.sid).remove();
     res.json({ status: 'released', sid: req.params.sid });
@@ -244,7 +296,7 @@ app.delete('/api/numbers/:sid', requireTwilio, async (req, res) => {
 // console, or set programmatically) at this URL to receive incoming SMS/
 // verification codes server-side, then push them to your app's inbox UI.
 // ---------------------------------------------------------------------------
-app.post('/api/webhooks/sms', (req, res) => {
+app.post('/api/webhooks/sms', validateTwilio, (req, res) => {
   const { From, To, Body } = req.body;
   console.log(`SMS to ${To} from ${From}: ${Body}`);
   db.prepare('INSERT INTO messages (phone_number, from_number, body) VALUES (?, ?, ?)').run(To, From, Body);
@@ -260,6 +312,7 @@ app.listen(port, () => {
   console.log(`Stripe:        ${stripe ? 'OK' : 'NOT CONFIGURED (checkout/* routes will 503)'}`);
   console.log(`JWT_SECRET:    ${process.env.JWT_SECRET ? 'OK' : 'MISSING (auth will fail on first request)'}`);
   console.log(`SITE_URL:      ${process.env.SITE_URL || 'NOT SET (email links and Stripe redirects will be broken)'}`);
+  console.log(`ADMIN_KEY:      ${process.env.ADMIN_KEY ? 'OK' : 'NOT SET (admin routes disabled)'}`);
   console.log(`SMTP:          ${process.env.SMTP_HOST ? 'configured (not verified — check the inbox after signing up)' : 'NOT CONFIGURED (verification/reset emails will fail silently, logged as errors)'}`);
   console.log('--------------------');
 });
